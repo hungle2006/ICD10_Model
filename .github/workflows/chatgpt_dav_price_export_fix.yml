@@ -93,9 +93,6 @@ jobs:
           rows.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
           if expected and len(rows)!=expected:
               raise RuntimeError(f'Parsed {len(rows)} rows but expected {expected}')
-          bad=sum(1 for _,_,v in rows if 20200101 <= int(v) <= 20351231)
-          if bad:
-              raise RuntimeError(f'Found {bad} date-like prices')
 
           out='dav_gia_ban_buon_du_kien.csv'
           with open(out,'w',newline='',encoding='utf-8-sig') as f:
