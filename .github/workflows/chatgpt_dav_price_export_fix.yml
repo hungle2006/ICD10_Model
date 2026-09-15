@@ -1,4 +1,4 @@
-name: ChatGPT DAV price export FIX
+name: ChatGPT DAV full wholesale export
 
 on:
   push:
@@ -15,96 +15,183 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependency
-        run: python -m pip install --quiet requests beautifulsoup4
-      - name: Export final CSV
+        run: python -m pip install --quiet requests
+      - name: Export full DAV wholesale-price CSV
         run: |
           python - <<'PY'
-          import csv, re, time, requests
-          from bs4 import BeautifulSoup
-          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import csv
+          import re
+          import time
+          import requests
+          import concurrent.futures
+          from datetime import datetime
 
-          BASE='https://medibase.vn/search/medicine-pricing/?page={}'
-          HEADERS={'User-Agent':'Mozilla/5.0'}
+          URL = 'https://dichvucong.dav.gov.vn/api/services/app/quanLyGiaThuoc/GetListCongBoPublicPaging'
+          HEADERS = {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json, text/plain, */*',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+              'Origin': 'https://dichvucong.dav.gov.vn',
+              'Referer': 'https://dichvucong.dav.gov.vn/congbogiathuoc/index',
+          }
+          PAGE_SIZE = 50
 
-          def get_page(page,retries=5):
-              last=None
-              for i in range(retries):
+          def make_payload(skip):
+              return {
+                  'CongBoGiaThuoc': {},
+                  'KichHoat': True,
+                  'skipCount': skip,
+                  'maxResultCount': PAGE_SIZE,
+                  'sorting': None,
+              }
+
+          def fetch_result(skip, retries=6):
+              last = None
+              for attempt in range(retries):
                   try:
-                      r=requests.get(BASE.format(page),headers=HEADERS,timeout=30)
+                      r = requests.post(URL, json=make_payload(skip), headers=HEADERS, timeout=35)
                       r.raise_for_status()
-                      return r.text
-                  except Exception as e:
-                      last=e; time.sleep(1.5*(i+1))
-              raise RuntimeError(f'page {page} failed: {last}')
+                      payload = r.json()
+                      if not payload.get('success', True) and not payload.get('result'):
+                          raise RuntimeError(str(payload.get('error') or payload))
+                      return payload.get('result') or {}
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 + attempt * 2, 12))
+              raise RuntimeError(f'Failed DAV page skip={skip}: {last}')
 
-          def parse_page(html):
-              soup=BeautifulSoup(html,'html.parser')
-              table=soup.find('table')
-              if not table: raise RuntimeError('No table')
-              rows=[]
-              for tr in table.find_all('tr'):
-                  tds=tr.find_all('td')
-                  if len(tds)<7: continue
-                  drug=tds[0]
-                  ss=list(drug.stripped_strings)
-                  name=''
-                  for sel in ['a','strong','b']:
-                      el=drug.find(sel)
-                      if el and el.get_text(' ',strip=True):
-                          name=el.get_text(' ',strip=True); break
-                  if not name and ss:
-                      name=ss[0].strip()
-                  date=tds[6].get_text(' ',strip=True)
-                  if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',date):
-                      full=' '.join(drug.stripped_strings)
-                      md=re.search(r'Declared on\s*(\d{4}-\d{2}-\d{2})',full,re.I)
-                      date=md.group(1) if md else ''
-                  price_text=tds[4].get_text(' ',strip=True)
-                  digits=re.sub(r'[^0-9]','',price_text)
-                  price=int(digits) if digits else ''
-                  if name and price!='': rows.append([date,name,price])
-              return rows,soup
+          first = fetch_result(0)
+          total = int(first.get('totalCount') or 0)
+          first_items = first.get('items') or []
+          if total <= 0 or not first_items:
+              raise RuntimeError(f'No DAV records returned: total={total}, first={len(first_items)}')
+          print(f'DAV total_count={total}; page_size={PAGE_SIZE}; first_page={len(first_items)}')
 
-          first_html=get_page(1)
-          first_rows,soup=parse_page(first_html)
-          text=soup.get_text(' ',strip=True)
-          mp=re.search(r'Page\s*1\s*/\s*(\d+)',text,re.I)
-          total_pages=int(mp.group(1)) if mp else 237
-          mr=re.search(r'(\d[\d.,]*)\s+records found',text,re.I)
-          expected=int(re.sub(r'[^0-9]','',mr.group(1))) if mr else None
-          print('total_pages=',total_pages,'expected=',expected,'page1=',len(first_rows))
-          print('first2=',first_rows[:2])
-          if len(first_rows)<40:
-              raise RuntimeError('Unexpectedly few rows on page 1')
-          if first_rows[0][2] not in (25000,35000) and first_rows[1][2] not in (25000,35000):
-              raise RuntimeError(f'Page1 price validation failed: {first_rows[:2]}')
+          page_skips = list(range(0, total, PAGE_SIZE))
+          pages = {0: first_items}
+          errors = {}
 
-          pages={1:first_rows}
-          with ThreadPoolExecutor(max_workers=12) as ex:
-              futs={ex.submit(get_page,p):p for p in range(2,total_pages+1)}
-              for i,f in enumerate(as_completed(futs),1):
-                  p=futs[f]
-                  rows,_=parse_page(f.result())
-                  pages[p]=rows
-                  if i%25==0 or i==len(futs): print('done',i+1,'/',total_pages)
+          def worker(skip):
+              if skip == 0:
+                  return skip, first_items
+              result = fetch_result(skip)
+              return skip, result.get('items') or []
 
-          rows=[]
-          for p in range(1,total_pages+1): rows.extend(pages.get(p,[]))
-          rows.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
-          if expected and len(rows)!=expected:
-              raise RuntimeError(f'Parsed {len(rows)} rows but expected {expected}')
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+              futures = {executor.submit(worker, skip): skip for skip in page_skips[1:]}
+              for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+                  skip = futures[future]
+                  try:
+                      s, items = future.result()
+                      pages[s] = items
+                  except Exception as exc:
+                      errors[skip] = str(exc)
+                  if i % 25 == 0 or i == len(futures):
+                      print(f'completed pages={i+1}/{len(page_skips)}; errors={len(errors)}')
 
-          out='dav_gia_ban_buon_du_kien.csv'
-          with open(out,'w',newline='',encoding='utf-8-sig') as f:
-              w=csv.writer(f)
-              w.writerow(['Ngày cập nhật','Tên thuốc','Giá bán buôn dự kiến (VNĐ) (VAT)'])
+          # Retry failed pages serially to avoid losing records when DAV throttles concurrent calls.
+          if errors:
+              print('Retrying failed pages serially:', sorted(errors))
+              for skip in list(errors):
+                  result = fetch_result(skip, retries=8)
+                  pages[skip] = result.get('items') or []
+                  errors.pop(skip, None)
+
+          all_items = []
+          missing_pages = []
+          for skip in page_skips:
+              if skip not in pages:
+                  missing_pages.append(skip)
+              else:
+                  all_items.extend(pages[skip])
+          if missing_pages:
+              raise RuntimeError(f'Missing page offsets: {missing_pages[:20]}')
+          if len(all_items) != total:
+              raise RuntimeError(f'Incomplete DAV export: got {len(all_items)} rows, expected {total}')
+
+          def clean_text(v):
+              if v is None:
+                  return ''
+              return re.sub(r'\s+', ' ', str(v)).strip()
+
+          def clean_date(v):
+              if not v:
+                  return ''
+              s = str(v).strip()
+              if 'T' in s:
+                  s = s.split('T', 1)[0]
+              elif ' ' in s and re.match(r'^\d{4}-\d{2}-\d{2}', s):
+                  s = s[:10]
+              return s
+
+          def clean_price(v):
+              if v is None or v == '':
+                  return ''
+              if isinstance(v, (int, float)):
+                  return int(round(float(v)))
+              s = str(v).strip()
+              # API values may contain separators; price target should be numeric VND in CSV.
+              s2 = re.sub(r'[^0-9.,-]', '', s)
+              if not s2:
+                  return ''
+              # Treat dots/commas as thousands separators unless a decimal suffix is obvious.
+              digits = re.sub(r'[^0-9-]', '', s2)
+              try:
+                  return int(digits)
+              except Exception:
+                  return s
+
+          rows = []
+          for item in all_items:
+              rows.append([
+                  clean_text(item.get('tenThuoc')),
+                  clean_text(item.get('hoatChat')),
+                  clean_text(item.get('hamLuong')),
+                  clean_text(item.get('dangBaoChe')),
+                  clean_text(item.get('quyCachDongGoi')),
+                  clean_text(item.get('donViTinh')),
+                  clean_text(item.get('doanhNghiepSanXuat')),
+                  clean_text(item.get('nuocSanXuat')),
+                  clean_text(item.get('soDangKy')),
+                  clean_date(item.get('ngayTiepNhan')),
+                  clean_price(item.get('giaBanBuonDuKien')),
+              ])
+
+          # Preserve all declarations; sort newest declaration first for easier analysis.
+          rows.sort(key=lambda r: (r[9], r[0], str(r[8])), reverse=True)
+
+          headers = [
+              'Tên thuốc',
+              'Hoạt chất',
+              'Nồng độ / hàm lượng',
+              'Dạng bào chế',
+              'Quy cách đóng gói',
+              'Đơn vị',
+              'Nhà sản xuất',
+              'Nước sản xuất',
+              'Số đăng ký',
+              'Ngày kê khai',
+              'Giá bán buôn dự kiến (VNĐ) (VAT)',
+          ]
+          out = 'dav_gia_ban_buon_day_du.csv'
+          with open(out, 'w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(headers)
               w.writerows(rows)
-          print('rows=',len(rows),'first=',rows[:3])
+
+          nonempty_price = sum(1 for r in rows if r[10] != '')
+          nonempty_name = sum(1 for r in rows if r[0] != '')
+          print(f'Wrote {len(rows)} rows to {out}; names={nonempty_name}; prices={nonempty_price}')
+          print('First 3 rows:', rows[:3])
+          if nonempty_name < len(rows) * 0.99:
+              raise RuntimeError('Too many missing drug names')
+          if nonempty_price < len(rows) * 0.95:
+              raise RuntimeError('Too many missing wholesale prices')
           PY
-      - name: Upload final CSV
+      - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dav-gia-ban-buon-du-kien-final
-          path: dav_gia_ban_buon_du_kien.csv
+          name: dav-gia-ban-buon-day-du
+          path: dav_gia_ban_buon_day_du.csv
           if-no-files-found: error
           retention-days: 1
