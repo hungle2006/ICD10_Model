@@ -1,0 +1,126 @@
+name: ChatGPT DAV price export
+
+on:
+  push:
+    branches: [chatgpt-dav-price-export]
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: python -m pip install --quiet requests
+      - name: Export DAV wholesale prices
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv, math, time, requests, urllib3
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime
+
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+          URL = 'https://dichvucong.dav.gov.vn/api/services/app/quanLyGiaThuoc/GetListCongBoPublicPaging'
+          HEADERS = {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json, text/plain, */*',
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+              'Origin': 'https://dichvucong.dav.gov.vn',
+              'Referer': 'https://dichvucong.dav.gov.vn/congbogiathuoc/index',
+          }
+
+          def payload(skip, n):
+              return {
+                  'CongBoGiaThuoc': {},
+                  'KichHoat': True,
+                  'skipCount': skip,
+                  'maxResultCount': n,
+                  'sorting': None,
+              }
+
+          def post(skip, n, retries=6):
+              last = None
+              for i in range(retries):
+                  try:
+                      r = requests.post(URL, json=payload(skip, n), headers=HEADERS,
+                                        timeout=60, verify=False)
+                      r.raise_for_status()
+                      data = r.json()
+                      result = data.get('result') or {}
+                      return result
+                  except Exception as e:
+                      last = e
+                      time.sleep(min(2 ** i, 20))
+              raise RuntimeError(f'Failed skip={skip}: {last}')
+
+          first_requested = 1000
+          first = post(0, first_requested)
+          first_items = first.get('items') or []
+          total = int(first.get('totalCount') or len(first_items))
+          if not first_items:
+              raise RuntimeError('DAV API returned no records on first page')
+          page_size = len(first_items)
+          print(f'totalCount={total}; requested={first_requested}; actual_page_size={page_size}')
+
+          pages = {0: first_items}
+          offsets = list(range(page_size, total, page_size))
+
+          def fetch_offset(skip):
+              return skip, (post(skip, page_size).get('items') or [])
+
+          with ThreadPoolExecutor(max_workers=6) as ex:
+              futures = [ex.submit(fetch_offset, s) for s in offsets]
+              for idx, fut in enumerate(as_completed(futures), 1):
+                  skip, items = fut.result()
+                  pages[skip] = items
+                  if idx % 25 == 0 or idx == len(futures):
+                      got = sum(len(v) for v in pages.values())
+                      print(f'pages {idx}/{len(futures)}; records={got}/{total}')
+
+          all_items = []
+          for skip in sorted(pages):
+              all_items.extend(pages[skip])
+
+          def date_only(v):
+              if not v:
+                  return ''
+              s = str(v).strip()
+              if 'T' in s:
+                  return s.split('T', 1)[0]
+              if ' ' in s and len(s) >= 10:
+                  return s[:10]
+              return s
+
+          rows = []
+          for item in all_items:
+              rows.append([
+                  date_only(item.get('ngayTiepNhan') or item.get('lastModificationTime') or item.get('creationTime')),
+                  (item.get('tenThuoc') or '').strip(),
+                  item.get('giaBanBuonDuKien') if item.get('giaBanBuonDuKien') is not None else '',
+              ])
+
+          # Preserve all API records; order newest first when dates are available.
+          rows.sort(key=lambda r: (r[0], r[1]), reverse=True)
+
+          out = 'dav_gia_ban_buon_du_kien.csv'
+          with open(out, 'w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(['Ngày cập nhật', 'Tên thuốc', 'Giá bán buôn dự kiến (VNĐ) (VAT)'])
+              w.writerows(rows)
+
+          print(f'Wrote {len(rows)} rows to {out}')
+          if len(rows) < total:
+              raise RuntimeError(f'Incomplete export: {len(rows)} < {total}')
+          PY
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: dav-gia-ban-buon-du-kien
+          path: dav_gia_ban_buon_du_kien.csv
+          if-no-files-found: error
+          retention-days: 1
