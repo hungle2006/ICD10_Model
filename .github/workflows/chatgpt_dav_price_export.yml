@@ -16,106 +16,17 @@ jobs:
           python-version: '3.12'
       - name: Install dependency
         run: python -m pip install --quiet requests beautifulsoup4
-      - name: Export DAV wholesale prices from DAV mirror
-        shell: bash
+      - name: Diagnose pricing table
         run: |
           python - <<'PY'
-          import csv, re, time, requests
+          import requests
           from bs4 import BeautifulSoup
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-
-          BASE = 'https://medibase.vn/search/medicine-pricing/?page={}'
-          HEADERS = {'User-Agent': 'Mozilla/5.0'}
-
-          def get_page(page, retries=5):
-              last = None
-              for i in range(retries):
-                  try:
-                      r = requests.get(BASE.format(page), headers=HEADERS, timeout=30)
-                      r.raise_for_status()
-                      return r.text
-                  except Exception as e:
-                      last = e
-                      time.sleep(1.5 * (i + 1))
-              raise RuntimeError(f'page {page} failed: {last}')
-
-          def parse_page(html):
-              soup = BeautifulSoup(html, 'html.parser')
-              rows = []
-              table = soup.find('table')
-              if not table:
-                  raise RuntimeError('No pricing table found')
-              for tr in table.find_all('tr'):
-                  tds = tr.find_all('td')
-                  if len(tds) < 4:
-                      continue
-                  drug_cell = tds[0]
-                  full = ' '.join(drug_cell.stripped_strings)
-                  mdate = re.search(r'Declared on\s*(\d{4}-\d{2}-\d{2})', full, re.I)
-                  date = mdate.group(1) if mdate else ''
-
-                  # Prefer first link/strong element as the trade name; otherwise first text node.
-                  name = ''
-                  for selector in ['a', 'strong', 'b']:
-                      el = drug_cell.find(selector)
-                      if el and el.get_text(' ', strip=True):
-                          name = el.get_text(' ', strip=True)
-                          break
-                  if not name:
-                      parts = list(drug_cell.stripped_strings)
-                      name = parts[0].strip() if parts else ''
-
-                  price_text = tds[-1].get_text(' ', strip=True)
-                  digits = re.sub(r'[^0-9]', '', price_text)
-                  price = int(digits) if digits else ''
-                  if name and price != '':
-                      rows.append([date, name, price])
-              return rows, soup
-
-          first_html = get_page(1)
-          first_rows, first_soup = parse_page(first_html)
-          if not first_rows:
-              raise RuntimeError('No records parsed from first page')
-
-          text = first_soup.get_text(' ', strip=True)
-          m = re.search(r'Page\s*1\s*/\s*(\d+)', text, re.I)
-          total_pages = int(m.group(1)) if m else 237
-          m2 = re.search(r'(\d[\d,\.]*)\s+records found', text, re.I)
-          expected = int(re.sub(r'[^0-9]', '', m2.group(1))) if m2 else None
-          print(f'total_pages={total_pages}; expected_records={expected}')
-
-          pages = {1: first_rows}
-          with ThreadPoolExecutor(max_workers=12) as ex:
-              futs = {ex.submit(get_page, p): p for p in range(2, total_pages + 1)}
-              for idx, fut in enumerate(as_completed(futs), 1):
-                  p = futs[fut]
-                  html = fut.result()
-                  rows, _ = parse_page(html)
-                  pages[p] = rows
-                  if idx % 25 == 0 or idx == len(futs):
-                      print(f'parsed {idx+1}/{total_pages} pages')
-
-          rows = []
-          for p in range(1, total_pages + 1):
-              rows.extend(pages.get(p, []))
-
-          # Preserve all rows, including repeated drug names with distinct declarations/prices.
-          rows.sort(key=lambda r: (r[0], r[1], r[2]), reverse=True)
-
-          if expected and len(rows) != expected:
-              raise RuntimeError(f'Parsed {len(rows)} rows but expected {expected}')
-
-          out = 'dav_gia_ban_buon_du_kien.csv'
-          with open(out, 'w', newline='', encoding='utf-8-sig') as f:
-              w = csv.writer(f)
-              w.writerow(['Ngày cập nhật', 'Tên thuốc', 'Giá bán buôn dự kiến (VNĐ) (VAT)'])
-              w.writerows(rows)
-          print(f'Wrote {len(rows)} rows to {out}')
+          html=requests.get('https://medibase.vn/search/medicine-pricing/?page=1',headers={'User-Agent':'Mozilla/5.0'},timeout=30).text
+          soup=BeautifulSoup(html,'html.parser')
+          table=soup.find('table')
+          for tr in table.find_all('tr')[1:3]:
+              tds=tr.find_all('td')
+              print('TD COUNT',len(tds))
+              for i,td in enumerate(tds):
+                  print('TD',i,repr(' | '.join(td.stripped_strings)))
           PY
-      - name: Upload CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: dav-gia-ban-buon-du-kien
-          path: dav_gia_ban_buon_du_kien.csv
-          if-no-files-found: error
-          retention-days: 1
