@@ -1,4 +1,4 @@
-name: ChatGPT DAV price export
+name: ChatGPT DAV mirror full export
 
 on:
   push:
@@ -16,17 +16,109 @@ jobs:
           python-version: '3.12'
       - name: Install dependency
         run: python -m pip install --quiet requests beautifulsoup4
-      - name: Diagnose pricing table
+      - name: Export full DAV mirror CSV
         run: |
           python - <<'PY'
-          import requests
+          import csv, re, time, requests
           from bs4 import BeautifulSoup
-          html=requests.get('https://medibase.vn/search/medicine-pricing/?page=1',headers={'User-Agent':'Mozilla/5.0'},timeout=30).text
-          soup=BeautifulSoup(html,'html.parser')
-          table=soup.find('table')
-          for tr in table.find_all('tr')[1:3]:
-              tds=tr.find_all('td')
-              print('TD COUNT',len(tds))
-              for i,td in enumerate(tds):
-                  print('TD',i,repr(' | '.join(td.stripped_strings)))
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          BASE='https://medibase.vn/search/medicine-pricing/?page={}'
+          HEADERS={'User-Agent':'Mozilla/5.0'}
+
+          def get_page(page,retries=5):
+              last=None
+              for i in range(retries):
+                  try:
+                      r=requests.get(BASE.format(page),headers=HEADERS,timeout=30)
+                      r.raise_for_status()
+                      return r.text
+                  except Exception as e:
+                      last=e; time.sleep(1.5*(i+1))
+              raise RuntimeError(f'page {page} failed: {last}')
+
+          def clean(s):
+              return re.sub(r'\s+',' ',s or '').strip()
+
+          def parse_page(html):
+              soup=BeautifulSoup(html,'html.parser')
+              table=soup.find('table')
+              if not table:
+                  raise RuntimeError('pricing table not found')
+              rows=[]
+              for tr in table.find_all('tr'):
+                  tds=tr.find_all('td', recursive=False)
+                  if len(tds) < 7:
+                      continue
+                  # td0 has exactly 3 visible desktop divs first: name; ingredient · strength; dosage form.
+                  top_divs=tds[0].find_all('div', recursive=False)
+                  name=clean(top_divs[0].get_text(' ',strip=True)) if len(top_divs)>0 else ''
+                  ing_strength=clean(top_divs[1].get_text(' ',strip=True)) if len(top_divs)>1 else ''
+                  dosage=clean(top_divs[2].get_text(' ',strip=True)) if len(top_divs)>2 else ''
+                  if ' · ' in ing_strength:
+                      ingredient, strength = [clean(x) for x in ing_strength.split(' · ',1)]
+                  else:
+                      ingredient, strength = ing_strength, ''
+
+                  reg=clean(tds[1].get_text(' ',strip=True))
+                  packaging=clean(tds[2].get_text(' ',strip=True))
+                  unit=clean(tds[3].get_text(' ',strip=True))
+                  ptxt=clean(tds[4].get_text(' ',strip=True))
+                  pdigits=re.sub(r'[^0-9]','',ptxt)
+                  price=int(pdigits) if pdigits else ''
+                  maker_divs=tds[5].find_all('div', recursive=False)
+                  manufacturer=clean(maker_divs[0].get_text(' ',strip=True)) if len(maker_divs)>0 else clean(tds[5].get_text(' ',strip=True))
+                  country=clean(maker_divs[1].get_text(' ',strip=True)) if len(maker_divs)>1 else ''
+                  date=clean(tds[6].get_text(' ',strip=True))
+
+                  if name:
+                      rows.append([name,ingredient,strength,dosage,packaging,unit,manufacturer,country,reg,date,price])
+              return rows,soup
+
+          first_html=get_page(1)
+          first_rows,soup=parse_page(first_html)
+          text=soup.get_text(' ',strip=True)
+          mp=re.search(r'Page\s*1\s*/\s*(\d+)',text,re.I)
+          total_pages=int(mp.group(1)) if mp else 237
+          mr=re.search(r'(\d[\d.,]*)\s+records found',text,re.I)
+          expected=int(re.sub(r'[^0-9]','',mr.group(1))) if mr else None
+          print('total_pages=',total_pages,'expected=',expected,'page1=',len(first_rows))
+          print('first2=',first_rows[:2])
+          if len(first_rows)<40:
+              raise RuntimeError('unexpectedly few rows on page 1')
+
+          pages={1:first_rows}
+          with ThreadPoolExecutor(max_workers=12) as ex:
+              futs={ex.submit(get_page,p):p for p in range(2,total_pages+1)}
+              for i,f in enumerate(as_completed(futs),1):
+                  p=futs[f]
+                  rows,_=parse_page(f.result())
+                  pages[p]=rows
+                  if i%25==0 or i==len(futs):
+                      print('done',i+1,'/',total_pages)
+
+          rows=[]
+          for p in range(1,total_pages+1):
+              rows.extend(pages.get(p,[]))
+          rows.sort(key=lambda x:(x[9],x[0],x[8],x[10] if x[10] != '' else -1), reverse=True)
+          if expected and len(rows)!=expected:
+              raise RuntimeError(f'Parsed {len(rows)} rows but expected {expected}')
+
+          out='dav_gia_ban_buon_day_du.csv'
+          with open(out,'w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f)
+              w.writerow([
+                  'Tên thuốc','Hoạt chất','Nồng độ / hàm lượng','Dạng bào chế',
+                  'Quy cách đóng gói','Đơn vị','Nhà sản xuất','Nước sản xuất',
+                  'Số đăng ký','Ngày kê khai','Giá bán buôn dự kiến (VNĐ) (VAT)'
+              ])
+              w.writerows(rows)
+          print('rows=',len(rows),'first=',rows[:3])
           PY
+      - name: Upload full CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: dav-gia-ban-buon-day-du-mirror
+          path: dav_gia_ban_buon_day_du.csv
+          if-no-files-found: error
+          retention-days: 1
