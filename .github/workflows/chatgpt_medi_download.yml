@@ -17,7 +17,7 @@ jobs:
           set -euo pipefail
           mkdir -p out
           python - <<'PY'
-          import urllib.request
+          import urllib.request, os
           url = 'https://wei-lab.app.vumc.org/assets/resources/MEDI_Combined.csv'
           dst = 'out/MEDI_Combined.csv'
           req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
@@ -27,24 +27,10 @@ jobs:
                   if not chunk:
                       break
                   f.write(chunk)
-          print('downloaded', dst)
+          print('downloaded_bytes=', os.path.getsize(dst))
           PY
-          python - <<'PY'
-          import csv, os, collections
-          p='out/MEDI_Combined.csv'
-          vocab=collections.Counter(); hps=collections.Counter(); n=0
-          with open(p, encoding='utf-8-sig', newline='') as f:
-              reader=csv.DictReader(f)
-              print('columns=', reader.fieldnames)
-              for row in reader:
-                  n += 1
-                  vocab[row.get('VOCABULARY','')] += 1
-                  hps[row.get('HIGH_PRECISION_SUBSET','')] += 1
-          print('rows=', n)
-          print('vocabulary=', dict(vocab))
-          print('hps=', dict(hps))
-          print('bytes=', os.path.getsize(p))
-          PY
+          wc -l out/MEDI_Combined.csv || true
+          file out/MEDI_Combined.csv || true
 
       - name: Upload MEDI artifact
         uses: actions/upload-artifact@v4
