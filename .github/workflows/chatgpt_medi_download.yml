@@ -30,13 +30,19 @@ jobs:
           print('downloaded', dst)
           PY
           python - <<'PY'
-          import pandas as pd, os
+          import csv, os, collections
           p='out/MEDI_Combined.csv'
-          df=pd.read_csv(p)
-          print('shape=', df.shape)
-          print('columns=', df.columns.tolist())
-          print('vocabulary=', df['VOCABULARY'].value_counts(dropna=False).to_dict())
-          print('hps=', df['HIGH_PRECISION_SUBSET'].value_counts(dropna=False).to_dict())
+          vocab=collections.Counter(); hps=collections.Counter(); n=0
+          with open(p, encoding='utf-8-sig', newline='') as f:
+              reader=csv.DictReader(f)
+              print('columns=', reader.fieldnames)
+              for row in reader:
+                  n += 1
+                  vocab[row.get('VOCABULARY','')] += 1
+                  hps[row.get('HIGH_PRECISION_SUBSET','')] += 1
+          print('rows=', n)
+          print('vocabulary=', dict(vocab))
+          print('hps=', dict(hps))
           print('bytes=', os.path.getsize(p))
           PY
 
